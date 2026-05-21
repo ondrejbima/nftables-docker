@@ -2,7 +2,7 @@
 # nftables-docker-events.sh
 #
 # Dva úkoly:
-#   1. Po startu: injectuje Docker mark (0x00050000) do existujících child chainů
+#   1. Po startu: injectuje Docker mark bit (DOCKER_MARK=0x00010000) do existujících child chainů
 #      (nahrazuje původní nftables-docker-hook.sh v ExecStartPost)
 #   2. Za běhu: sleduje Docker network eventy a injectuje marky do nových chainů
 #
@@ -13,6 +13,8 @@ set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 NFT=/usr/sbin/nft
 
+DOCKER_MARK=0x00010000
+
 inject_docker_child_chains() {
     local family="$1"
     local chains
@@ -21,27 +23,36 @@ inject_docker_child_chains() {
 
     for chain in $chains; do
         local existing
-        existing=$("$NFT" list chain "$family" docker-bridges "$chain" 2>/dev/null) || continue
+        existing=$("$NFT" -a list chain "$family" docker-bridges "$chain" 2>/dev/null) || continue
 
-        if ! echo "$existing" | grep -Fq 'ct mark set 0x00050000'; then
-            "$NFT" insert rule "$family" docker-bridges "$chain" ct mark set 0x00050000
-        fi
-        if ! echo "$existing" | grep -Fq 'meta mark set 0x00050000'; then
-            "$NFT" insert rule "$family" docker-bridges "$chain" meta mark set 0x00050000
-        fi
+        # Odstranit predchozi Docker mark inserty a vlozit aktualni variantu znovu.
+        echo "$existing" | awk -v docker_mark="$DOCKER_MARK" '/meta mark set/ && index($0, docker_mark) {print $NF}' | while read -r handle; do
+            [[ -n "$handle" ]] || continue
+            "$NFT" delete rule "$family" docker-bridges "$chain" handle "$handle" 2>/dev/null || true
+        done
+        echo "$existing" | awk -v docker_mark="$DOCKER_MARK" '/ct mark set/ && index($0, docker_mark) {print $NF}' | while read -r handle; do
+            [[ -n "$handle" ]] || continue
+            "$NFT" delete rule "$family" docker-bridges "$chain" handle "$handle" 2>/dev/null || true
+        done
+
+        "$NFT" insert rule "$family" docker-bridges "$chain" ct mark set ct mark or "$DOCKER_MARK"
+        "$NFT" insert rule "$family" docker-bridges "$chain" meta mark set meta mark or "$DOCKER_MARK"
     done
 }
 
 # Naplni chain docker-mark-input v inet filter mark-injekcnimi pravidly
 # pro kazdy aktualni Docker bridge. Konzistentni s forward path (insert do child chainu).
 inject_docker_input_marks() {
+    local bridges
+
     "$NFT" flush chain inet filter docker-mark-input 2>/dev/null || return 0
-    "$NFT" list table ip docker-bridges 2>/dev/null \
-        | awk '/chain filter-forward-in__/{sub(/.*filter-forward-in__/, ""); print $1}' \
-        | while read -r bridge; do
-            "$NFT" add rule inet filter docker-mark-input iifname "$bridge" meta mark set 0x00050000 2>/dev/null || true
-            "$NFT" add rule inet filter docker-mark-input iifname "$bridge" ct mark set 0x00050000 2>/dev/null || true
-        done
+    bridges=$("$NFT" list table ip docker-bridges 2>/dev/null \
+        | awk '/chain filter-forward-in__/{sub(/.*filter-forward-in__/, ""); print $1}') || return 0
+
+    for bridge in $bridges; do
+        "$NFT" add rule inet filter docker-mark-input iifname "$bridge" meta mark set mark or "$DOCKER_MARK" 2>/dev/null || true
+        "$NFT" add rule inet filter docker-mark-input iifname "$bridge" ct mark set ct mark or "$DOCKER_MARK" 2>/dev/null || true
+    done
 }
 
 # 1. Počáteční injekce při startu service.

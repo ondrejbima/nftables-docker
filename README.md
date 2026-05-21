@@ -26,8 +26,22 @@ podle interface, IP adresy nebo portu (kromě nutných výjimek popsaných níž
 
 | Mark (hex)   | Kdo nastaví                          | Co identifikuje                    |
 |--------------|--------------------------------------|------------------------------------|
-| `0x00050000` | events skript (do Docker child chainů a `docker-mark-input`) | Veškerý Docker provoz (inbound i egress i kontejner→host) |
-| `0x00000400` | Tailscale daemon (`ts-forward` chain) | Provoz přicházející z Tailscale VPN |
+| `0x00010000` | events skript (do Docker child chainů a `docker-mark-input`) | Boolean-like flag `is_docker` pro veškerý Docker provoz |
+| `0x00000400` | Tailscale daemon (`ts-forward` chain) | Boolean-like flag `is_tailscale` pro provoz z Tailscale VPN |
+
+V `nftables.conf` jsou tyto bity pojmenované přes:
+```nft
+define is_docker = 0x00010000
+define is_tailscale = 0x00000400
+```
+
+Pravidla se pak dají číst jako:
+```nft
+oifname "tailscale0" meta mark & $is_docker == $is_docker drop
+```
+
+Poznámka: `nft list ruleset` vypisuje live ruleset už s expandovanými hodnotami, takže v běžícím
+výpisu uvidíš zase `0x00010000`, ne název `$is_docker`.
 
 **Proč dvě hodnoty (`meta mark` a `ct mark`)?**
 - `meta mark` – mark aktuálního paketu; platí jen pro tento paket.
@@ -63,22 +77,25 @@ podle interface, IP adresy nebo portu (kromě nutných výjimek popsaných níž
   priority 0: inet filter / chain input        priority 0: ip docker-bridges / filter-FORWARD
     ├─ ct state established,related accept        └─ vmap @filter-forward-in-jumps
     ├─ iif "lo" accept                                └─ filter-forward-in__br-XXX
-    ├─ jump docker-mark-input                             ├─ [0] meta mark set 0x00050000 ← inject
-    │    └─ iifname "br-XXX" meta mark set 0x00050000    ├─ [1] ct mark set 0x00050000   ← inject
-    │    └─ iifname "br-XXX" ct mark set 0x00050000      └─ Docker's own rules
-    ├─ mark 0x00050000 → ip daddr 100.100.188.1 drop
-    ├─ tcp dport 22 accept                       priority 0 (pokračování):
-    ├─ tcp dport {80,443} accept                   └─ vmap @filter-forward-out-jumps
-    └─ ... ostatní port pravidla ...                   └─ filter-forward-out__br-XXX
-                                                           ├─ [0] meta mark set 0x00050000 ← inject
-                                                           ├─ [1] ct mark set 0x00050000   ← inject
+    ├─ jump docker-mark-input                             ├─ [0] meta mark set meta mark | 0x00010000 ← inject
+    │    └─ iifname "br-XXX" meta mark set meta mark | 0x00010000    ├─ [1] ct mark set ct mark | 0x00010000   ← inject
+    │    └─ iifname "br-XXX" ct mark set ct mark | 0x00010000        └─ Docker's own rules
+    ├─ mark 0x00010000 → ip daddr 100.100.188.1 drop
+    ├─ iifname "eth0" → jump internet-services    priority 0 (pokračování):
+    │    ├─ ct original proto-dst 22 accept         └─ vmap @filter-forward-out-jumps
+    │    ├─ ct original proto-dst {80,443} accept       └─ filter-forward-out__br-XXX
+    │    └─ meta l4proto {tcp,udp} log+drop             ├─ [0] meta mark set meta mark | 0x00010000 ← inject
+    └─ tcp dport 22 accept (privátní vstup)             ├─ [1] ct mark set ct mark | 0x00010000   ← inject
+                                                           ├─ [0] meta mark set meta mark | 0x00010000 ← inject
+                                                           ├─ [1] ct mark set ct mark | 0x00010000   ← inject
                                                            └─ Docker's own rules
 
                                                priority 10: inet filter / chain forward  ← náš policy
                                                  ├─ ct state established,related accept
-                                                 ├─ oifname "tailscale0" + Docker mark → DROP
+                                                 ├─ iifname "eth0" → jump internet-services
+                                                 ├─ oifname "tailscale0" + Docker mark → log + DROP
                                                  ├─ Tailscale mark (0x00000400) → accept
-                                                 ├─ Docker mark (0x00050000) → accept
+                                                 ├─ Docker mark (0x00010000) → accept
                                                  └─ counter + log + DROP
          │
   POSTROUTING (NAT, priority 100)
@@ -95,7 +112,7 @@ aby marky viděl. `filter + 10` = `0 + 10` = 10. Docker child chain → mark set
 
 ```nft
 # BROKEN – toto je mrtvý kód, nikdy se nevykoná:
-iifname vmap @filter-forward-in-jumps meta mark set 0x00050000
+iifname vmap @filter-forward-in-jumps meta mark set meta mark | 0x00010000
 ```
 
 `vmap` je terminální verdict – je to `jump`, po kterém se provádění **nevrací** do volajícího
@@ -117,13 +134,13 @@ Routing decision: dst 172.20.0.5 je za Docker bridge → FORWARD
 FORWARD priority 0 (Docker filter-FORWARD):
   vmap @filter-forward-out-jumps[br-3009d48bc4d0]
     → filter-forward-out__br-3009d48bc4d0
-        [0] meta mark set 0x00050000  ✓
-        [1] ct mark set 0x00050000    ✓
+        [0] meta mark set meta mark | 0x00010000  ✓
+        [1] ct mark set ct mark | 0x00010000      ✓
 
 FORWARD priority 10 (náš chain forward):
   ct state established,related? → ne (nové spojení)
   oifname "tailscale0"? → ne (oifname je br-3009d48bc4d0)
-  meta mark 0x00050000? → ANO → accept ✓
+  meta mark 0x00010000? → ANO → accept ✓
 
 POSTROUTING: oifname "br-3009d48bc4d0" → žádné masquerade pravidlo (masquerade jen pro eth0)
 
@@ -138,16 +155,16 @@ Kontejner (172.20.0.5) → br-3009d48bc4d0 → Routing decision: dst 1.1.1.1 →
 FORWARD priority 0 (Docker filter-FORWARD):
   vmap @filter-forward-in-jumps[br-3009d48bc4d0]
     → filter-forward-in__br-3009d48bc4d0
-        [0] meta mark set 0x00050000  ✓
-        [1] ct mark set 0x00050000    ✓
+        [0] meta mark set meta mark | 0x00010000  ✓
+        [1] ct mark set ct mark | 0x00010000      ✓
 
 FORWARD priority 10 (náš chain forward):
   ct state established,related? → ne
   oifname "tailscale0"? → ne (oifname je eth0)
-  meta mark 0x00050000? → ANO → accept ✓
+  meta mark 0x00010000? → ANO → accept ✓
 
 POSTROUTING:
-  oifname "eth0" + meta mark 0x00050000 → masquerade (src přepíše na 178.104.116.206)
+  oifname "eth0" + meta mark 0x00010000 → masquerade (src přepíše na 178.104.116.206)
 
 Paket odejde na internet se zdrojovou IP serveru.
 ```
@@ -157,11 +174,11 @@ Paket odejde na internet se zdrojovou IP serveru.
 ```
 Kontejner (172.20.0.5) → pokouší se o 100.100.0.5 (jiný Tailscale uzel)
 
-FORWARD priority 0: filter-forward-in__br-XXX → meta mark set 0x00050000 ✓
+FORWARD priority 0: filter-forward-in__br-XXX → meta mark set meta mark | 0x00010000 ✓
 
 FORWARD priority 10 (náš chain forward):
   ct state established,related? → ne
-  oifname "tailscale0" + meta mark 0x00050000? → ANO → DROP ✗
+  oifname "tailscale0" + meta mark 0x00010000? → ANO → DROP ✗
 
 Paket zahozen. Kontejner se nedostane na Tailscale síť.
 ```
@@ -179,9 +196,9 @@ INPUT priority 0 (náš chain input):
   ct state established,related? → ne (nové spojení)
   iif "lo"? → ne (iifname je br-3009d48bc4d0)
   jump docker-mark-input:
-    iifname "br-3009d48bc4d0" → meta mark set 0x00050000 ✓
-    iifname "br-3009d48bc4d0" → ct mark set 0x00050000   ✓
-  meta mark 0x00050000 + ip daddr 100.100.188.1? → ANO → DROP ✗
+    iifname "br-3009d48bc4d0" → meta mark set meta mark | 0x00010000 ✓
+    iifname "br-3009d48bc4d0" → ct mark set ct mark | 0x00010000     ✓
+  meta mark 0x00010000 + ip daddr 100.100.188.1? → ANO → DROP ✗
 
 Paket zahozen.
 ```
@@ -196,7 +213,7 @@ INPUT priority 0 (náš chain input):
   iif "lo"? → ne
   jump docker-mark-input:
     iifname "tailscale0" → žádné pravidlo v docker-mark-input → mark zůstane 0
-  meta mark 0x00050000 + ip daddr 100.100.188.1? → mark=0 ≠ 0x00050000 → ne
+  meta mark 0x00010000 + ip daddr 100.100.188.1? → mark=0 ≠ 0x00010000 → ne
   tcp dport 22? → ANO → accept ✓  (pokud jde o SSH)
 ```
 
@@ -225,10 +242,17 @@ Hlavní firewall. Načítán `nftables.service` při bootu.
 **Důležité části:**
 - `chain docker-mark-input` – prázdný chain, dynamicky plněný events skriptem; volán přes `jump`
   z `chain input`; nastavuje Docker mark pro pakety z Docker bridge rozhraní v input cestě.
-- `chain input` – policy drop; povoluje established/related, loopback, SSH, web porty, Tailscale
-  porty; blokuje Docker→Tailscale IP přes mark.
-- `chain forward` – policy drop, priority `filter+10`; blokuje Docker→Tailscale (mark+oifname),
-  pak povoluje Tailscale mark a Docker mark; vše ostatní zahazuje s logem.
+- `chain internet-services` – centrální allowlist pro veřejné služby; používá
+  `ct original proto-dst`, takže jedno pravidlo funguje stejně pro host službu i Docker published
+  port po DNAT.
+- `chain docker-to-tailscale` – sdílený blok pro Docker→Tailscale; je volán z `chain input` i
+  `chain forward` a drží všechna pravidla na jednom místě.
+- `chain input` – policy drop; povoluje established/related a loopback; Docker pakety po
+  `docker-mark-input` posílá do `chain docker-to-tailscale`, pak nové veřejné spojení z `eth0`
+  do `chain internet-services`.
+- `chain forward` – policy drop, priority `filter+10`; nejdřív volá `chain docker-to-tailscale`,
+  pak nové veřejné spojení z `eth0` posílá do `chain internet-services`; zbytek řeší Tailscale a
+  Docker mark accept pravidla.
 - `table inet nat / chain postrouting` – masquerade pro Docker a Tailscale na `eth0`.
 
 ### `nftables-docker-events.sh` → `/usr/local/bin/nftables-docker-events.sh`
@@ -236,16 +260,17 @@ Hlavní firewall. Načítán `nftables.service` při bootu.
 Skript se dvěma funkcemi:
 
 **`inject_docker_child_chains <family>`**
-Injectuje `meta mark set 0x00050000` + `ct mark set 0x00050000` jako **první dvě pravidla**
+Injectuje `meta mark set meta mark | 0x00010000` + `ct mark set ct mark | 0x00010000` jako
+**první dvě pravidla**
 do každého Docker child chainu (`filter-forward-in__*` a `filter-forward-out__*`).
 Tyto chainy jsou volány výhradně přes Docker's vmap – jsou přesným identifikátorem Docker provozu
-ve forward path. Idempotentní (nekopíruje pravidla pokud již existují).
+ve forward path. Při startu nejprve odstraní své předchozí inserty s aktuálním Docker bitem a vloží je znovu.
 
 **`inject_docker_input_marks`**
 Flushuje chain `inet filter docker-mark-input` a pro každý aktuální Docker bridge přidá:
 ```nft
-iifname "br-XXX" meta mark set 0x00050000
-iifname "br-XXX" ct mark set 0x00050000
+iifname "br-XXX" meta mark set meta mark | 0x00010000
+iifname "br-XXX" ct mark set ct mark | 0x00010000
 ```
 Tím pokrývá input path (kontejner → lokální adresa hostu), kde Docker child chainy neběží.
 
@@ -288,8 +313,14 @@ sudo systemctl enable nftables.service
 # Všechny tři klíčové services běží
 sudo systemctl is-active nftables nftables-docker-events docker
 
+# internet-services: centrální allowlist veřejných portů
+sudo nft list chain inet filter internet-services
+
 # forward chain: priority 10, policy drop, Docker→Tailscale blok, mark accept
 sudo nft list chain inet filter forward
+
+# docker-to-tailscale: sdílený blok pro input i forward
+sudo nft list chain inet filter docker-to-tailscale
 
 # input chain: jump docker-mark-input, mark-based Tailscale blok
 sudo nft list chain inet filter input
@@ -317,16 +348,27 @@ docker run --rm curlimages/curl:8.8.0 --max-time 5 telnet://100.100.188.1:22 2>&
 
 ## Jak povolit / změnit provoz
 
-### Otevřít nový port na hostu z internetu
+### Povolit novou veřejnou službu (host i Docker)
 
-Přidej pravidlo do `chain input` v `nftables.conf`, před závěrečný `log + drop`:
+Veřejné porty se řídí v jediném místě: `chain internet-services`.
+Používá `ct original proto-dst`, takže stejné pravidlo funguje pro:
+- nativní službu na hostu
+- Docker published port po DNAT
+
+Pravidla přidávej před závěrečný `meta l4proto { tcp, udp } log ... drop`:
 
 ```nft
-# Příklad: povolení portu 9090 pro Prometheus ze specifické IP
-tcp dport 9090 ip saddr 10.0.0.1 ct state new accept
+# TCP port otevřený všem
+meta l4proto tcp ct original proto-dst 8080 accept
 
-# Příklad: povolení portu 5432 (PostgreSQL) jen z Tailscale
-tcp dport 5432 ip saddr 100.0.0.0/8 ct state new accept
+# TCP port jen z jedné veřejné IP
+ip saddr 203.0.113.10 meta l4proto tcp ct original proto-dst 8080 accept
+
+# TCP port jen z více veřejných IP
+ip saddr { 203.0.113.10, 198.51.100.25 } meta l4proto tcp ct original proto-dst 8443 accept
+
+# UDP port otevřený všem
+meta l4proto udp ct original proto-dst 3478 accept
 ```
 
 Pak:
@@ -337,13 +379,21 @@ sudo systemctl restart nftables-docker-events.service  # re-inject marků
 
 ### Publikovat nový port z Docker kontejneru
 
-Stačí přidat `ports:` v `docker-compose.yml`. Docker sám přidá DNAT pravidlo do `ip nat/PREROUTING`
-a přidá accept pravidlo do svých chainů. Firewall to automaticky povolí – Docker provoz má mark
-`0x00050000` a ten je v `chain forward` přijat.
+Potřebuješ dva kroky:
+1. Publikovat port v `docker-compose.yml`.
+2. Přidat odpovídající pravidlo do `chain internet-services`.
 
 ```yaml
 ports:
-  - "8081:8081"   # Docker to zařídí sám, žádná změna nftables není potřeba
+  - "8081:8081"
+```
+
+```nft
+# Varianta A: port 8081 otevřený všem
+meta l4proto tcp ct original proto-dst 8081 accept
+
+# Varianta B: port 8081 jen z jedné veřejné IP
+ip saddr 1.2.3.4 meta l4proto tcp ct original proto-dst 8081 accept
 ```
 
 ### Zakázat Docker kontejnerům přístup na internet (egress)
@@ -352,52 +402,41 @@ Ve `chain forward` přidej pravidlo **před** Docker mark accept:
 
 ```nft
 # Blokovat egress z konkrétní Docker bridge sítě (zjisti oifname: ip link show)
-iifname "br-3009d48bc4d0" oifname "eth0" meta mark & 0x00ff0000 == 0x00050000 drop
+iifname "br-3009d48bc4d0" oifname "eth0" meta mark & $is_docker == $is_docker drop
 ```
 
 Nebo blokovat všem Docker kontejnerům (pozor – přestane fungovat i Traefik proxy):
 ```nft
-oifname "eth0" meta mark & 0x00ff0000 == 0x00050000 drop
+oifname "eth0" meta mark & $is_docker == $is_docker drop
 ```
 
 ### Povolit Docker kontejneru přístup na konkrétní Tailscale IP (výjimka)
 
 Aktuálně je blokován veškerý Docker→Tailscale provoz. Pro výjimku přidej pravidlo **před** blok
-ve `chain forward`:
+do `chain docker-to-tailscale`:
 
 ```nft
 # Příklad: povolení přístupu z Dockeru na konkrétní Tailscale uzel 100.100.0.5
-oifname "tailscale0" ip daddr 100.100.0.5 meta mark & 0x00ff0000 == 0x00050000 accept
+meta mark & $is_docker == $is_docker ip daddr 100.100.0.5 accept
 ```
 
-A do `chain input` přidej výjimku **před** Tailscale IP blok (pro případ že jde o lokální IP):
-```nft
-meta mark & 0x00ff0000 == 0x00050000 ip daddr 100.100.188.1 tcp dport 8080 accept
-```
+Pokud jde o lokální Tailscale IP tohoto hostu, stejný chain už pokrývá i `input` cestu; výjimku
+přidej tam stejným stylem, jen podle cílové adresy.
 
 ### Povolit Docker kontejnerům přístup na celý Tailscale (zrušení bloku)
 
-Odstraň nebo zakomentuj z `chain forward`:
-```nft
-# tyto dva řádky smaž nebo zakomentuj:
-oifname "tailscale0" meta mark & 0x00ff0000 == 0x00050000 drop
-oifname "tailscale0" ct mark & 0x00ff0000 == 0x00050000 drop
-```
-A z `chain input` odstraň:
-```nft
-meta mark & 0x00ff0000 == 0x00050000 ip daddr 100.100.188.1 drop
-meta mark & 0x00ff0000 == 0x00050000 ip6 daddr fd7a:115c:a1e0:188::1 drop
-```
+Odstraň nebo zakomentuj odpovídající řádky z `chain docker-to-tailscale`.
 
 ### Přidat pravidlo trvale vs. dočasně
 
 **Dočasně** (platí do restartu nebo reloadu nftables):
 ```bash
-# Příklad: dočasně povolit port 9999
-sudo nft add rule inet filter input tcp dport 9999 ct state new accept
+# Příklad: dočasně povolit port 9999 v centrálním allowlistu
+# Použij insert, protože na konci chainu je log+drop.
+sudo nft insert rule inet filter internet-services meta l4proto tcp ct original proto-dst 9999 accept
 ```
 
-**Trvale**: uprav `nftables.conf`, pak `sudo nft -f /etc/nftables.conf && sudo systemctl restart nftables-docker-events.service`.
+**Trvale**: uprav `chain internet-services` v `nftables.conf`, pak `sudo nft -f /etc/nftables.conf && sudo systemctl restart nftables-docker-events.service`.
 
 ---
 
@@ -454,9 +493,9 @@ sudo nft list ruleset
 ### Ověřit, že mark byl nastaven
 
 ```bash
-# Spusť kontejner a sleduj, jestli conntrack záznam má mark 0x00050000
+# Spusť kontejner a sleduj, jestli conntrack záznam má mark 0x00010000
 docker run -d --name test-mark nginx
 sudo conntrack -L | grep 172.20   # po přístupu na kontejner
-# hledej: mark=327680 (= 0x00050000 decimálně)
+# hledej: mark=65536 (= 0x00010000 decimálně)
 docker rm -f test-mark
 ```
