@@ -1,0 +1,13 @@
+[Unit]
+Description=nftables Docker mark injector – network events listener
+After=docker.service nftables.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nftables-docker-events.sh
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
